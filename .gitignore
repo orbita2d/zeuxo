@@ -1,0 +1,20 @@
+.vscode
+.claude
+
+# python / uv
+.venv
+__pycache__/
+*.pyc
+
+# training artifacts
+checkpoints/
+*.log
+*.gen
+
+# engine build artifacts
+*.exe
+*.dll
+*.dll.a
+Makefile
+CMakeFiles
+CMakeCache.txt

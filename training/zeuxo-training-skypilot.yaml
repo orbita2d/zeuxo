@@ -1,0 +1,51 @@
+name: zeuxo-training
+
+resources:
+  accelerators: RTX4090:1
+  cloud: runpod
+  disk_size: 200
+  image_id: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
+
+envs:
+  TS_AUTHKEY:  # ephemeral tailscale key, populated from local env at launch
+  MLFLOW_TRACKING_URI: http://junebug:5000
+  MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING: true
+  MLFLOW_EXPERIMENT: zeuxo-training
+  ITERATIONS: 200000
+  TRAIN_FILE: /datasets/chess-data
+  CHECKPOINT_PATH: /checkpoints
+  HYPERPARAM_ACCUMULATOR_SIZE: 256
+
+file_mounts:
+  /datasets/chess-data:
+    source: r2://chess-stuff/data-2026-06-06  # TODO: point at zeuxo's dataset
+    mode: COPY
+
+  ~/training.py: ./training.py
+
+setup: |
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  curl -fsSL https://tailscale.com/install.sh | sh
+  mkdir -p /checkpoints
+
+run: |
+  set -euo pipefail
+
+  tailscaled \
+    --tun=userspace-networking \
+    --socks5-server=localhost:1055 \
+    --outbound-http-proxy-listen=localhost:1055 \
+    > /tmp/tailscaled.log 2>&1 &
+
+  until [ -S /var/run/tailscale/tailscaled.sock ]; do sleep 0.2; done
+
+  tailscale up --authkey="${TS_AUTHKEY}" --hostname="skypilot-$(hostname)"
+  tailscale status
+
+  # Route mlflow traffic over the tailnet; keep PyPI fetches direct so uv install isn't proxied
+  export HTTP_PROXY=http://localhost:1055
+  export HTTPS_PROXY=http://localhost:1055
+  export NO_PROXY=pypi.org,*.pypi.org,files.pythonhosted.org,*.pythonhosted.org
+
+  unset LD_LIBRARY_PATH
+  ~/.local/bin/uv run --python 3.12 ~/training.py
