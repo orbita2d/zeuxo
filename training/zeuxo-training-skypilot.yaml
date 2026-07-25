@@ -1,20 +1,18 @@
 name: zeuxo-training
 
 resources:
-  accelerators: RTX4090:1
+  accelerators: H200-SXM:1
   cloud: runpod
   disk_size: 200
-  image_id: runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404
 
 envs:
   TS_AUTHKEY:  # ephemeral tailscale key, populated from local env at launch
   MLFLOW_TRACKING_URI: http://junebug:5000
   MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING: true
   MLFLOW_EXPERIMENT: zeuxo-training
-  ITERATIONS: 200000
+  TRAIN_BOARDS:  # boards-seen budget, set at launch (e.g. 280000000 for ~12h on H200)
   TRAIN_FILE: /datasets/chess-data
   CHECKPOINT_PATH: /checkpoints
-  HYPERPARAM_ACCUMULATOR_SIZE: 256
 
 file_mounts:
   /datasets/chess-data:

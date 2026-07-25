@@ -38,90 +38,127 @@ logger = logging.getLogger(__name__)
 
 # --- board / feature geometry -------------------------------------------------
 N_SQUARES = 64
-N_PIECE_TYPES = 5  # pawn, knight, bishop, rook, queen (king handled separately)
-N_FEATURES = N_SQUARES * N_PIECE_TYPES
+N_PIECE_TYPES = 13  # pawn, knight, bishop, rook, queen, king per side (6*2) + empty (1) encoded as 0
+ASPECT_RATIO = 128 # Width of the residual stream per transformer block
+MODEL_LAYERS = 8 # How many transformer blocks to use; the single scale knob
+MODEL_WIDTH = ASPECT_RATIO * MODEL_LAYERS # Width of the residual stream
+ATTENTION_WIDTH = 64 # Width of each attention head
+N_HEADS = MODEL_WIDTH // ATTENTION_WIDTH # How many attention heads to use in the transformer
+assert ATTENTION_WIDTH * N_HEADS == MODEL_WIDTH, "Attention width must divide model width evenly"
+
 LOGISTIC_SCALING = 400.0  # centipawns -> win prob via sigmoid(eval / scaling)
 
-# --- hyperparameters (env-var driven, same pattern as admete) -----------------
-HYPERPARAM_ACCUMULATOR_SIZE = int(os.environ.get("HYPERPARAM_ACCUMULATOR_SIZE", 256))
-HYPERPARAM_HIDDEN_SIZE = int(os.environ.get("HYPERPARAM_HIDDEN_SIZE", 32))
 HYPERPARAM_LEARNING_RATE_PEAK = float(os.environ.get("HYPERPARAM_LEARNING_RATE_PEAK", 4e-3))
 HYPERPARAM_LEARNING_RATE_END = float(os.environ.get("HYPERPARAM_LEARNING_RATE_END", 2e-6))
 HYPERPARAM_BATCH_SIZE_LOG = int(os.environ.get("HYPERPARAM_BATCH_SIZE_LOG", 14))  # 2^14 = 16384
 
-ITERATIONS = os.environ.get("ITERATIONS", None)
+TRAIN_BOARDS = os.environ.get("TRAIN_BOARDS", None)
 SEED = int(os.environ.get("SEED", 314159))
 
 PARENT_RUN_ID = os.environ.get("PARENT_RUN_ID", None)
 RUN_ID = os.environ.get("RUN_ID", None)
 MLFLOW_RUN_DESCRIPTION = os.environ.get("MLFLOW_RUN_DESCRIPTION")
-MLFLOW_EXPERIMENT = os.environ.get("MLFLOW_EXPERIMENT", "zeuxo-training")
+MLFLOW_EXPERIMENT = os.environ.get("MLFLOW_EXPERIMENT", "zeuxo")
 
 TRAIN_FILE = os.environ.get("TRAIN_FILE")
 CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH")
 
+class Attention(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.q = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs)
+        self.k = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs)
+        self.v = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs)
+        self.o = nnx.Linear(ATTENTION_WIDTH * N_HEADS, MODEL_WIDTH, use_bias=False, rngs=rngs)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        # x: (batch, seq_len, MODEL_WIDTH)
+        q = self.q(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
+        k = self.k(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
+        v = self.v(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
+
+        attn = jax.nn.dot_product_attention(q, k, v, bias=None, is_causal=False)
+        o = self.o(attn.reshape(x.shape[0], x.shape[1], N_HEADS * ATTENTION_WIDTH))
+        return o # (batch, seq_len, MODEL_WIDTH)
+
+
+class MLP(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.fc1 = nnx.Linear(MODEL_WIDTH, MODEL_WIDTH * 4, use_bias=False, rngs=rngs)
+        self.fc2 = nnx.Linear(MODEL_WIDTH * 4, MODEL_WIDTH, use_bias=False, rngs=rngs)
+        
+    def __call__(self, x: jax.Array) -> jax.Array:
+        # x: (batch, seq_len, MODEL_WIDTH)
+        x = nnx.gelu(self.fc1(x))
+        x = self.fc2(x)
+        return x # (batch, seq_len, MODEL_WIDTH)
+
+class TransformerBlock(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.attn = Attention(rngs=rngs)
+        self.mlp = MLP(rngs=rngs)
+        self.norm1 = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs)
+        self.norm2 = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        # x: (batch, seq_len, MODEL_WIDTH)
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x # (batch, seq_len, MODEL_WIDTH)
+    
 
 class ZeuxoModel(nnx.Module):
-    """
-    Perspective-net evaluator. Two accumulators (side-to-move + opponent) share a
-    single feature-transformer weight, are concatenated, and run through a small
-    MLP head to a single scalar (centipawn-ish) evaluation.
-    """
-
     def __init__(self, rngs: nnx.Rngs):
-        acc = HYPERPARAM_ACCUMULATOR_SIZE
-        hidden = HYPERPARAM_HIDDEN_SIZE
-
         # shared feature transformer applied to each perspective independently
-        self.feature_transformer = nnx.Linear(N_FEATURES, acc, rngs=rngs, use_bias=True)
-        self.hidden_layer = nnx.Linear(2 * acc, hidden, rngs=rngs, use_bias=True)
-        self.output_layer = nnx.Linear(hidden, 1, rngs=rngs, use_bias=True)
+        self.embedding = nnx.Embed(N_PIECE_TYPES, MODEL_WIDTH-N_SQUARES, rngs=rngs)
 
-    def __call__(self, us: jax.Array, them: jax.Array) -> jax.Array:
-        assert us.shape[1] == N_FEATURES
-        assert us.shape == them.shape
+        self.blocks = [
+            TransformerBlock(rngs=rngs) for _ in range(MODEL_LAYERS)
+        ]
+        self.final_norm = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs)
+        self.head = nnx.Linear(MODEL_WIDTH, 1, use_bias=False, rngs=rngs)
 
-        acc_us = self.feature_transformer(us)
-        acc_them = self.feature_transformer(them)
-        # clipped relu keeps the accumulator quantisation-friendly (NNUE convention)
-        x = jnp.concatenate([acc_us, acc_them], axis=-1)
-        x = jnp.clip(x, 0.0, 1.0)
-        x = nnx.relu(self.hidden_layer(x))
-        x = self.output_layer(x)
-        return jnp.reshape(x, (-1,))
+
+    def __call__(self, tokens: jax.Array) -> jax.Array:
+        assert tokens.ndim == 2 and tokens.shape[1] == N_SQUARES # (batch, 64)
+
+        pos = jnp.broadcast_to(jax.nn.one_hot(jnp.arange(N_SQUARES), N_SQUARES), (tokens.shape[0], N_SQUARES, N_SQUARES)) # (batch, 64, 64)
+        x = jnp.concatenate([self.embedding(tokens), pos], axis=-1)
+
+        for block in self.blocks:
+            x = block(x) # (batch, 64, MODEL_WIDTH)
+
+        x = self.final_norm(x) # (batch, 64, MODEL_WIDTH)
+        x_reduced = jnp.mean(x, axis=1) # (batch, MODEL_WIDTH)
+        logits = jnp.squeeze(self.head(x_reduced), axis=-1) # (batch,)
+        return logits
 
 
 def normalise_eval(eval: jax.Array, logistic_scaling: float) -> jax.Array:
     return nnx.sigmoid(eval / logistic_scaling)
 
 
-def loss_fn(pred: jax.Array, labels: jax.Array) -> jax.Array:
+def loss_fn(logits: jax.Array, labels: jax.Array) -> jax.Array:
     # binary cross entropy between predicted and target win probabilities
-    eps = 1e-7
-    assert pred.shape == labels.shape
-    labels = jnp.clip(labels, eps, 1 - eps)
-    pred = jnp.clip(pred, eps, 1 - eps)
-    return -jnp.mean(labels * jnp.log(pred) + (1 - labels) * jnp.log(1 - pred))
+    assert logits.shape == labels.shape
+    return jnp.mean(optax.sigmoid_binary_cross_entropy(logits, labels))
 
 
 @nnx.jit
-def train_step(model: nnx.Module, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, batch: dict[str, jax.Array]):
+def train_step(model: ZeuxoModel, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, batch: dict[str, jax.Array]):
     def loss(model: ZeuxoModel):
-        pred = model(batch["f_us"], batch["f_them"])
-        return loss_fn(nnx.sigmoid(pred), batch["label"])
+        return loss_fn(model(batch["features"]), batch["label"])
 
-    grads = nnx.grad(loss)(model)
-    loss_val = loss(model)
+    loss_val, grads = nnx.value_and_grad(loss)(model)
     optimizer.update(grads)
     metrics.update(loss=loss_val)
 
 
 @nnx.jit
-def eval_step(model: nnx.Module, metrics: nnx.MultiMetric, batch: dict[str, jax.Array]):
-    pred = nnx.sigmoid(model(batch["f_us"], batch["f_them"]))
-    label = batch["label"]
+def eval_step(model: ZeuxoModel, metrics: nnx.MultiMetric, batch: dict[str, jax.Array]):
+    logits = model(batch["features"])
+    pred = nnx.sigmoid(logits)
     metrics.update(
-        loss=loss_fn(pred, label),
+        loss=loss_fn(logits, batch["label"]),
         winning_ratio=jnp.mean(pred > 0.8),
         losing_ratio=jnp.mean(pred < 0.2),
     )
@@ -130,22 +167,24 @@ def eval_step(model: nnx.Module, metrics: nnx.MultiMetric, batch: dict[str, jax.
 @jax.jit
 def unpack_features(features: jax.Array) -> dict[str, jax.Array]:
     """
-    Turn a (batch, 64) board of piece codes into side-to-move and opponent
-    half-kp-free feature planes.
+    Turn a (batch, 64) board of piece codes into our feature representation for the model.
 
-    Encoding (adjust to match your data generator):
+    Input Encoding:
+      0    -> empty square
       1..5   -> our pawn..queen,   6  -> our king
       9..13  -> their pawn..queen, 14 -> their king
-    The opponent perspective is the vertically-flipped board.
+    
+      From movers (our) perspective
+    Output Encoding:
+        0 -> empty square
+        1..5 -> our pawn..queen
+        6 -> our king
+        7..11 -> their pawn..queen
+        12 -> their king
     """
-    us_codes = [1, 2, 3, 4, 5]
-    them_codes = [9, 10, 11, 12, 13]
+    transformed = jnp.where(features > 7, features - 2, features)
 
-    flipped = jnp.flip(features.reshape(-1, 8, 8), axis=1).reshape(-1, 64)
-
-    f_us = jnp.concat([jnp.array(features == c, dtype=jnp.int8) for c in us_codes], axis=1)
-    f_them = jnp.concat([jnp.array(flipped == c, dtype=jnp.int8) for c in them_codes], axis=1)
-    return {"f_us": f_us, "f_them": f_them}
+    return {"features": transformed}
 
 
 class FileSource:
@@ -161,10 +200,8 @@ class FileSource:
             pa.field("eval", pa.int32()),
             pa.field("setType", pa.string()),
         ])
-        partition = pds.partitioning(pa.schema([pa.field("setType", pa.string(), nullable=False)]))
+        partition = pds.partitioning(pa.schema([pa.field("setType", pa.string(), nullable=False)]), flavor="hive")
 
-        # cap in-memory rows so a big dataset doesn't blow the box (~80 GiB budget)
-        self.max_rows = 24 * (1 << 30) // (feature_length + 4)
         self.ds = pds.dataset(path, partitioning=partition, schema=schema)
         self.path = path
         self.logistic_scaling = logistic_scaling
@@ -173,9 +210,9 @@ class FileSource:
         for split in ("train", "test", "validation"):
             logger.info(f"{split:>10} samples: {self.samples(split):>12,}")
 
-        self._training_data = self.ds.head(self.samples("train"), filter=pds.field("setType") == "setType=train")
+        self._training_data = self.ds.head(self.samples("train"), filter=pds.field("setType") == "train")
         self.ds_jax = {"test": self.load_to_device(
-            self.ds.head(self.samples("test"), filter=pds.field("setType") == "setType=test")
+            self.ds.head(self.samples("test"), filter=pds.field("setType") == "test")
         )}
         logger.info(f"Test set on device {self.ds_jax['test']['features'].device}")
 
@@ -183,10 +220,7 @@ class FileSource:
         return self.ds.count_rows()
 
     def samples(self, dataset: Literal["test", "train", "validation"]) -> int:
-        assert dataset in ("test", "train", "validation")
-        max_rows = min(self.max_rows, self.ds.count_rows())
-        n = self.ds.count_rows(filter=pds.field("setType") == f"setType={dataset}")
-        return int(n / self.ds.count_rows() * max_rows)
+        return self.ds.count_rows(filter=pds.field("setType") == dataset)
 
     def load_to_device(self, table: pa.Table) -> dict[str, jax.Array]:
         features = jnp.from_dlpack(table.column("features").combine_chunks().values).reshape(-1, 64)
@@ -198,9 +232,9 @@ class FileSource:
 
     def batched(self, batch_size: int, *, dataset: Literal["test", "train", "validation"], repeat: bool = True):
         if dataset == "test":
-            yield from self._batched_from_device(batch_size, dataset="test")
+            yield from self._batched_from_device(batch_size, dataset="test") # test set is already on device
         else:
-            yield from self._batched_lazy(batch_size, dataset=dataset, repeat=repeat)
+            yield from self._batched_lazy(batch_size, dataset=dataset, repeat=repeat) # train and validation sets are loaded lazily from ram or disk.
 
     def _batched_from_device(self, batch_size: int, dataset: str):
         ds = self.ds_jax[dataset]
@@ -215,13 +249,16 @@ class FileSource:
         if dataset == "train":
             chunk = self._training_data
         elif dataset == "validation":
-            chunk = self.ds.head(self.samples("validation"), filter=pds.field("setType") == "setType=validation")
+            chunk = self.ds.head(self.samples("validation"), filter=pds.field("setType") == "validation")
         else:
             raise ValueError(dataset)
 
+        rng = np.random.default_rng(SEED)
         while True:
+            perm = rng.permutation(chunk.num_rows) if dataset == "train" else None
             for i in range(0, chunk.num_rows - batch_size + 1, batch_size):
-                arr = self.load_to_device(chunk.slice(offset=i, length=batch_size))
+                batch = chunk.take(perm[i:i + batch_size]) if perm is not None else chunk.slice(offset=i, length=batch_size)
+                arr = self.load_to_device(batch)
                 yield {**unpack_features(arr["features"]), "label": arr["label"]}
             if not repeat:
                 break
@@ -233,12 +270,14 @@ class FileSource:
 def main() -> None:
     assert TRAIN_FILE is not None, "TRAIN_FILE environment variable is not set."
     assert CHECKPOINT_PATH is not None, "CHECKPOINT_PATH environment variable is not set."
-    assert ITERATIONS is not None, "ITERATIONS environment variable is not set."
+    assert TRAIN_BOARDS is not None, "TRAIN_BOARDS environment variable is not set."
 
     train_file = Path(TRAIN_FILE)
     assert train_file.exists(), f"Train file {train_file} does not exist."
-    iterations = int(ITERATIONS)
-    assert iterations > 0, f"Iterations must be positive, not {iterations}."
+    train_boards = int(TRAIN_BOARDS)
+    batch_size = 1 << HYPERPARAM_BATCH_SIZE_LOG
+    iterations = train_boards // batch_size
+    assert iterations > 0, f"Train boards {train_boards} must be at least the batch size {batch_size}."
 
     checkpoint_root = Path(CHECKPOINT_PATH)
     assert checkpoint_root.exists(), f"Checkpoint path {checkpoint_root} does not exist."
@@ -250,7 +289,7 @@ def main() -> None:
 
     logger.info(f"JAX {jax.__version__} | Flax {flax.__version__} | Optax {optax.__version__} | Orbax {ocp.__version__}")
     logger.info(f"devices: {jax.devices()}")
-    logger.info(f"Train file: {train_file} | Output: {checkpoint_path} | Iterations: {iterations}")
+    logger.info(f"Train file: {train_file} | Output: {checkpoint_path} | Boards: {train_boards:,} -> {iterations:,} iterations of {batch_size}")
 
     # snapshot the exact training script alongside the checkpoints
     script_path = Path(__file__).resolve()
@@ -258,22 +297,28 @@ def main() -> None:
 
     data_loader = FileSource(train_file, LOGISTIC_SCALING)
 
-    batch_size = 1 << HYPERPARAM_BATCH_SIZE_LOG
     batch_size_adjustment = 14 - HYPERPARAM_BATCH_SIZE_LOG
     checkpoint_freq = 1 << (16 + batch_size_adjustment)
     validation_freq = 1 << (12 + batch_size_adjustment)
     steps_per_epoch = (len(data_loader) - 1) // batch_size + 1
 
     model = ZeuxoModel(rngs=nnx.Rngs(SEED))
+    n_params = sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(model, nnx.Param)))
+    logger.info(f"Model parameters: {n_params:,} (width {MODEL_WIDTH}, layers {MODEL_LAYERS}, heads {N_HEADS})")
 
     warmup_steps = iterations // 20  # 5%
     end_steps = iterations // 20  # 5%
     schedule = optax.join_schedules([
         optax.linear_schedule(0, HYPERPARAM_LEARNING_RATE_PEAK, warmup_steps),
-        optax.cosine_decay_schedule(HYPERPARAM_LEARNING_RATE_PEAK, iterations - warmup_steps - end_steps, HYPERPARAM_LEARNING_RATE_END),
+        optax.cosine_decay_schedule(HYPERPARAM_LEARNING_RATE_PEAK, iterations - warmup_steps - end_steps, HYPERPARAM_LEARNING_RATE_END / HYPERPARAM_LEARNING_RATE_PEAK),
         optax.constant_schedule(HYPERPARAM_LEARNING_RATE_END),
     ], boundaries=[warmup_steps, iterations - end_steps])
-    optimizer = nnx.Optimizer(model, optax.adamw(schedule))
+    def weight_decay_mask(params):
+        def is_kernel(path, _):
+            return any(getattr(k, "key", None) == "kernel" or getattr(k, "name", None) == "kernel" for k in path)
+        return jax.tree_util.tree_map_with_path(is_kernel, params)
+
+    optimizer = nnx.Optimizer(model, optax.adamw(schedule, mask=weight_decay_mask))
 
     train_metrics = nnx.MultiMetric(loss=nnx.metrics.Average("loss"))
     test_metrics = nnx.MultiMetric(
@@ -296,12 +341,15 @@ def main() -> None:
     with mlflow.start_run(parent_run_id=PARENT_RUN_ID, run_id=RUN_ID, description=MLFLOW_RUN_DESCRIPTION):
         mlflow.log_params({
             "train_file": str(train_file),
+            "n_params": n_params,
+            "model_width": MODEL_WIDTH,
+            "model_layers": MODEL_LAYERS,
+            "n_heads": N_HEADS,
+            "train_boards": train_boards,
             "iterations": iterations,
             "batch_size": batch_size,
             "batch_size_log": HYPERPARAM_BATCH_SIZE_LOG,
             "logistic_scaling": LOGISTIC_SCALING,
-            "size_accumulator": HYPERPARAM_ACCUMULATOR_SIZE,
-            "size_hidden": HYPERPARAM_HIDDEN_SIZE,
             "peak_lr": HYPERPARAM_LEARNING_RATE_PEAK,
             "end_lr": HYPERPARAM_LEARNING_RATE_END,
             "warmup_steps": warmup_steps,
@@ -311,7 +359,7 @@ def main() -> None:
         mlflow.set_tag("device", jax.devices()[0].device_kind)
         mlflow.log_artifact(str(script_path), artifact_path="code")
 
-        logger.info(f"Training for {iterations} iterations")
+        logger.info(f"Training for {train_boards:,} boards ({iterations:,} iterations)")
         for step, batch in enumerate(data_loader.batched(batch_size, dataset="train")):
             train_step(model, optimizer, train_metrics, batch)
 
@@ -331,6 +379,7 @@ def main() -> None:
                 with open(checkpoint_path / "metrics.csv", "a") as f:
                     f.write(f"{step},{epoch:.5f}," + ",".join(str(metrics_history[m][-1]) for m in metrics_history) + "\n")
                 mlflow.log_metric("epoch", epoch, step=step)
+                mlflow.log_metric("boards", step * batch_size, step=step)
                 mlflow.log_metric("learning_rate", float(schedule(step)), step=step)
                 for m in metrics_history:
                     mlflow.log_metric(m, metrics_history[m][-1], step=step)

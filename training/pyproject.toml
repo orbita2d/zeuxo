@@ -1,0 +1,22 @@
+[project]
+name = "zeuxo-training"
+version = "0.1.0"
+description = "Editor/dev environment for zeuxo training. Runtime deps live inline in training.py (PEP 723); this venv exists so Pylance can resolve jax/flax/etc. Uses CPU jax — same API surface, no CUDA wheels."
+readme = "../README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "jax~=0.6.0",
+    "flax~=0.10.6",
+    "optax",
+    "orbax",
+    "pandas",
+    "numpy",
+    "scipy",
+    "pyarrow",
+    "tqdm",
+    "mlflow",
+    "psutil",
+    "pynvml",
+    "ipykernel",
+    "skypilot[runpod]>=0.13.0",
+]
