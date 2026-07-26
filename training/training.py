@@ -68,12 +68,14 @@ MLFLOW_EXPERIMENT = os.environ.get("MLFLOW_EXPERIMENT", "zeuxo")
 TRAIN_FILE = os.environ.get("TRAIN_FILE")
 CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH")
 
+c_dtype = jnp.bfloat16
+
 class Attention(nnx.Module):
-    def __init__(self, rngs: nnx.Rngs):
-        self.q = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs)
-        self.k = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs)
-        self.v = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs)
-        self.o = nnx.Linear(ATTENTION_WIDTH * N_HEADS, MODEL_WIDTH, use_bias=False, rngs=rngs)
+    def __init__(self, rngs: nnx.Rngs, c_dtype=jnp.bfloat16):
+        self.q = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs, dtype=c_dtype)
+        self.k = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs, dtype=c_dtype)
+        self.v = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs, dtype=c_dtype)
+        self.o = nnx.Linear(ATTENTION_WIDTH * N_HEADS, MODEL_WIDTH, use_bias=False, rngs=rngs, dtype=c_dtype)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: (batch, seq_len, MODEL_WIDTH)
@@ -87,9 +89,9 @@ class Attention(nnx.Module):
 
 
 class MLP(nnx.Module):
-    def __init__(self, rngs: nnx.Rngs):
-        self.fc1 = nnx.Linear(MODEL_WIDTH, MODEL_WIDTH * 4, use_bias=False, rngs=rngs)
-        self.fc2 = nnx.Linear(MODEL_WIDTH * 4, MODEL_WIDTH, use_bias=False, rngs=rngs)
+    def __init__(self, rngs: nnx.Rngs, c_dtype=jnp.bfloat16):
+        self.fc1 = nnx.Linear(MODEL_WIDTH, MODEL_WIDTH * 4, use_bias=False, rngs=rngs, dtype=c_dtype)
+        self.fc2 = nnx.Linear(MODEL_WIDTH * 4, MODEL_WIDTH, use_bias=False, rngs=rngs, dtype=c_dtype)
         
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: (batch, seq_len, MODEL_WIDTH)
@@ -98,11 +100,11 @@ class MLP(nnx.Module):
         return x # (batch, seq_len, MODEL_WIDTH)
 
 class TransformerBlock(nnx.Module):
-    def __init__(self, rngs: nnx.Rngs):
-        self.attn = Attention(rngs=rngs)
-        self.mlp = MLP(rngs=rngs)
-        self.norm1 = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs)
-        self.norm2 = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs)
+    def __init__(self, rngs: nnx.Rngs, c_dtype=jnp.bfloat16, n_dtype=jnp.float32):
+        self.attn = Attention(rngs=rngs, c_dtype=c_dtype)
+        self.mlp = MLP(rngs=rngs, c_dtype=c_dtype)
+        self.norm1 = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs, dtype=n_dtype)
+        self.norm2 = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs, dtype=n_dtype)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: (batch, seq_len, MODEL_WIDTH)
@@ -114,19 +116,19 @@ class TransformerBlock(nnx.Module):
 class ZeuxoModel(nnx.Module):
     def __init__(self, rngs: nnx.Rngs):
         # shared feature transformer applied to each perspective independently
-        self.embedding = nnx.Embed(N_PIECE_TYPES, MODEL_WIDTH-N_SQUARES, rngs=rngs)
+        self.embedding = nnx.Embed(N_PIECE_TYPES, MODEL_WIDTH-N_SQUARES, rngs=rngs, dtype=c_dtype)
 
         self.blocks = [
-            TransformerBlock(rngs=rngs) for _ in range(MODEL_LAYERS)
+            TransformerBlock(rngs=rngs, c_dtype=c_dtype, n_dtype=jnp.bfloat16) for _ in range(MODEL_LAYERS)
         ]
-        self.final_norm = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs)
-        self.head = nnx.Linear(MODEL_WIDTH, 1, use_bias=False, rngs=rngs)
+        self.final_norm = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs, dtype=jnp.float32)
+        self.head = nnx.Linear(MODEL_WIDTH, 1, use_bias=False, rngs=rngs, dtype=c_dtype)
 
 
     def __call__(self, tokens: jax.Array) -> jax.Array:
         assert tokens.ndim == 2 and tokens.shape[1] == N_SQUARES # (batch, 64)
 
-        pos = jnp.broadcast_to(jax.nn.one_hot(jnp.arange(N_SQUARES), N_SQUARES), (tokens.shape[0], N_SQUARES, N_SQUARES)) # (batch, 64, 64)
+        pos = jnp.broadcast_to(jax.nn.one_hot(jnp.arange(N_SQUARES), N_SQUARES, dtype=jnp.float32), (tokens.shape[0], N_SQUARES, N_SQUARES)) # (batch, 64, 64)
         x = jnp.concatenate([self.embedding(tokens), pos], axis=-1)
 
         for block in self.blocks:
@@ -135,7 +137,7 @@ class ZeuxoModel(nnx.Module):
         x = self.final_norm(x) # (batch, 64, MODEL_WIDTH)
         x_reduced = jnp.mean(x, axis=1) # (batch, MODEL_WIDTH)
         logits = jnp.squeeze(self.head(x_reduced), axis=-1) # (batch,)
-        return logits
+        return logits.astype(jnp.float32) # (batch,)
 
 
 def normalise_eval(eval: jax.Array, logistic_scaling: float) -> jax.Array:
