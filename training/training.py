@@ -68,8 +68,6 @@ MLFLOW_EXPERIMENT = os.environ.get("MLFLOW_EXPERIMENT", "zeuxo")
 TRAIN_FILE = os.environ.get("TRAIN_FILE")
 CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH")
 
-c_dtype = jnp.bfloat16
-
 class Attention(nnx.Module):
     def __init__(self, rngs: nnx.Rngs, c_dtype=jnp.bfloat16):
         self.q = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs, dtype=c_dtype)
@@ -116,19 +114,19 @@ class TransformerBlock(nnx.Module):
 class ZeuxoModel(nnx.Module):
     def __init__(self, rngs: nnx.Rngs):
         # shared feature transformer applied to each perspective independently
-        self.embedding = nnx.Embed(N_PIECE_TYPES, MODEL_WIDTH-N_SQUARES, rngs=rngs, dtype=c_dtype)
+        self.embedding = nnx.Embed(N_PIECE_TYPES, MODEL_WIDTH-N_SQUARES, rngs=rngs)
 
         self.blocks = [
-            TransformerBlock(rngs=rngs, c_dtype=c_dtype, n_dtype=jnp.bfloat16) for _ in range(MODEL_LAYERS)
+            TransformerBlock(rngs=rngs, c_dtype=jnp.bfloat16, n_dtype=jnp.float32) for _ in range(MODEL_LAYERS)
         ]
         self.final_norm = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs, dtype=jnp.float32)
-        self.head = nnx.Linear(MODEL_WIDTH, 1, use_bias=False, rngs=rngs, dtype=c_dtype)
+        self.head = nnx.Linear(MODEL_WIDTH, 1, use_bias=False, rngs=rngs, dtype=jnp.bfloat16)
 
 
     def __call__(self, tokens: jax.Array) -> jax.Array:
         assert tokens.ndim == 2 and tokens.shape[1] == N_SQUARES # (batch, 64)
 
-        pos = jnp.broadcast_to(jax.nn.one_hot(jnp.arange(N_SQUARES), N_SQUARES, dtype=jnp.float32), (tokens.shape[0], N_SQUARES, N_SQUARES)) # (batch, 64, 64)
+        pos = jnp.broadcast_to(jax.nn.one_hot(jnp.arange(N_SQUARES), N_SQUARES), (tokens.shape[0], N_SQUARES, N_SQUARES)) # (batch, 64, 64)
         x = jnp.concatenate([self.embedding(tokens), pos], axis=-1)
 
         for block in self.blocks:
