@@ -81,7 +81,7 @@ class Attention(nnx.Module):
         k = self.k(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
         v = self.v(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
 
-        attn = jax.nn.dot_product_attention(q, k, v, bias=None, is_causal=False)
+        attn = jax.nn.dot_product_attention(q, k, v, bias=None, is_causal=False, implementation="cudnn")
         o = self.o(attn.reshape(x.shape[0], x.shape[1], N_HEADS * ATTENTION_WIDTH))
         return o # (batch, seq_len, MODEL_WIDTH)
 
