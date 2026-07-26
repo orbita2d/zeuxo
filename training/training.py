@@ -20,6 +20,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import time
 from typing import Literal
 
 import jax
@@ -48,9 +49,13 @@ assert ATTENTION_WIDTH * N_HEADS == MODEL_WIDTH, "Attention width must divide mo
 
 LOGISTIC_SCALING = 400.0  # centipawns -> win prob via sigmoid(eval / scaling)
 
-HYPERPARAM_LEARNING_RATE_PEAK = float(os.environ.get("HYPERPARAM_LEARNING_RATE_PEAK", 4e-3))
+EVAL_SAMPLES = 1 << 16  # fixed subsample of the test split, kept on device for periodic eval
+EVAL_SEED = 271828  # independent of SEED so the eval sample is identical across runs
+EVAL_FREQ_BOARDS = 1 << 21  # boards trained between in-loop evals (~1% eval overhead)
+
+HYPERPARAM_LEARNING_RATE_PEAK = float(os.environ.get("HYPERPARAM_LEARNING_RATE_PEAK", 1e-3))
 HYPERPARAM_LEARNING_RATE_END = float(os.environ.get("HYPERPARAM_LEARNING_RATE_END", 2e-6))
-HYPERPARAM_BATCH_SIZE_LOG = int(os.environ.get("HYPERPARAM_BATCH_SIZE_LOG", 14))  # 2^14 = 16384
+HYPERPARAM_BATCH_SIZE_LOG = int(os.environ.get("HYPERPARAM_BATCH_SIZE_LOG", 10))  # 2^10 = 1024
 
 TRAIN_BOARDS = os.environ.get("TRAIN_BOARDS", None)
 SEED = int(os.environ.get("SEED", 314159))
@@ -210,11 +215,18 @@ class FileSource:
         for split in ("train", "test", "validation"):
             logger.info(f"{split:>10} samples: {self.samples(split):>12,}")
 
-        self._training_data = self.ds.head(self.samples("train"), filter=pds.field("setType") == "train")
-        self.ds_jax = {"test": self.load_to_device(
-            self.ds.head(self.samples("test"), filter=pds.field("setType") == "test")
-        )}
-        logger.info(f"Test set on device {self.ds_jax['test']['features'].device}")
+        cols = ["features", "eval"]
+        self._training_data = self.ds.head(
+            self.samples("train"), columns=cols, filter=pds.field("setType") == "train"
+        ).combine_chunks()
+        test_table = self.ds.head(
+            self.samples("test"), columns=cols, filter=pds.field("setType") == "test"
+        ).combine_chunks()
+        perm = np.random.default_rng(EVAL_SEED).permutation(test_table.num_rows)
+        self.ds_jax = {"test": self.load_to_device(test_table.take(perm[:EVAL_SAMPLES]))}
+        self._test_remainder = test_table.take(perm[EVAL_SAMPLES:])
+        logger.info(f"Eval sample of {EVAL_SAMPLES:,} test boards on device {self.ds_jax['test']['features'].device}; "
+                    f"{self._test_remainder.num_rows:,} boards held back for the final sweep")
 
     def __len__(self):
         return self.ds.count_rows()
@@ -230,7 +242,7 @@ class FileSource:
         }
         return jax.device_put(arr, device=jax.devices()[0])
 
-    def batched(self, batch_size: int, *, dataset: Literal["test", "train", "validation"], repeat: bool = True):
+    def batched(self, batch_size: int, *, dataset: Literal["test", "test_remainder", "train", "validation"], repeat: bool = True):
         if dataset == "test":
             yield from self._batched_from_device(batch_size, dataset="test") # test set is already on device
         else:
@@ -248,8 +260,10 @@ class FileSource:
     def _batched_lazy(self, batch_size: int, *, dataset: str, repeat: bool):
         if dataset == "train":
             chunk = self._training_data
+        elif dataset == "test_remainder":
+            chunk = self._test_remainder
         elif dataset == "validation":
-            chunk = self.ds.head(self.samples("validation"), filter=pds.field("setType") == "validation")
+            chunk = self.ds.head(self.samples("validation"), columns=["features", "eval"], filter=pds.field("setType") == "validation")
         else:
             raise ValueError(dataset)
 
@@ -297,9 +311,7 @@ def main() -> None:
 
     data_loader = FileSource(train_file, LOGISTIC_SCALING)
 
-    batch_size_adjustment = 14 - HYPERPARAM_BATCH_SIZE_LOG
-    checkpoint_freq = 1 << (16 + batch_size_adjustment)
-    validation_freq = 1 << (12 + batch_size_adjustment)
+    validation_freq = EVAL_FREQ_BOARDS // batch_size
     steps_per_epoch = (len(data_loader) - 1) // batch_size + 1
 
     model = ZeuxoModel(rngs=nnx.Rngs(SEED))
@@ -333,7 +345,6 @@ def main() -> None:
     for m in test_metrics.compute():
         metrics_history[f"test_{m}"] = []
 
-    checkpointer = ocp.StandardCheckpointer()
     with open(checkpoint_path / "metrics.csv", "w") as f:
         f.write("step,epoch," + ",".join(metrics_history.keys()) + "\n")
 
@@ -360,10 +371,17 @@ def main() -> None:
         mlflow.log_artifact(str(script_path), artifact_path="code")
 
         logger.info(f"Training for {train_boards:,} boards ({iterations:,} iterations)")
+        t_last = time.perf_counter()
+        t_train_total = 0.0
+        last_timed_step = -1
         for step, batch in enumerate(data_loader.batched(batch_size, dataset="train")):
             train_step(model, optimizer, train_metrics, batch)
 
             if step % validation_freq == 0 or step == iterations - 1:
+                window = time.perf_counter() - t_last
+                t_train_total += window
+                step_time = window / (step - last_timed_step)
+                last_timed_step = step
                 epoch = step / steps_per_epoch
                 for m, v in train_metrics.compute().items():
                     metrics_history[f"train_{m}"].append(float(v))
@@ -375,36 +393,31 @@ def main() -> None:
                 test_metrics.reset()
 
                 logger.info(f"step {step:>8} (epoch {epoch:7.3f}): "
-                            f"train {metrics_history['train_loss'][-1]:.5f} | test {metrics_history['test_loss'][-1]:.5f}")
+                            f"train {metrics_history['train_loss'][-1]:.5f} | test {metrics_history['test_loss'][-1]:.5f} | "
+                            f"{batch_size / step_time:,.0f} boards/s")
                 with open(checkpoint_path / "metrics.csv", "a") as f:
                     f.write(f"{step},{epoch:.5f}," + ",".join(str(metrics_history[m][-1]) for m in metrics_history) + "\n")
                 mlflow.log_metric("epoch", epoch, step=step)
                 mlflow.log_metric("boards", step * batch_size, step=step)
                 mlflow.log_metric("learning_rate", float(schedule(step)), step=step)
+                mlflow.log_metric("boards_per_second", batch_size / step_time, step=step)
                 for m in metrics_history:
                     mlflow.log_metric(m, metrics_history[m][-1], step=step)
-
-            if step != 0 and step % checkpoint_freq == 0:
-                logger.info(f"Checkpointing at step {step}")
-                _, state = nnx.split(model)
-                checkpointer.save(str(checkpoint_path / f"state_{step}"), state)
+                t_last = time.perf_counter()
 
             if step >= iterations - 1:
                 break
 
-        logger.info("Training complete; running validation set")
-        test_metrics.reset()
-        data_loader.clear_in_memory()
-        for val_batch in data_loader.batched(batch_size, dataset="validation", repeat=False):
-            eval_step(model, test_metrics, val_batch)
-        for m, v in test_metrics.compute().items():
-            logger.info(f"validation {m}: {float(v):.5f}")
-            mlflow.log_metric(f"validation_{m}", float(v), step=iterations)
+        logger.info(f"Training complete; mean step time {t_train_total / iterations:.3f}s "
+                    f"({batch_size / (t_train_total / iterations):,.0f} boards/s)")
+        # test_metrics.reset()
+        # data_loader.clear_in_memory()
+        # for test_batch in data_loader.batched(batch_size, dataset="test_remainder", repeat=False):
+        #     eval_step(model, test_metrics, test_batch)
+        # for m, v in test_metrics.compute().items():
+        #     logger.info(f"test_remainder {m}: {float(v):.5f}")
+        #     mlflow.log_metric(f"test_remainder_{m}", float(v), step=iterations)
 
-        state = nnx.state(model)
-        checkpointer.save(str(checkpoint_path / "state"), state)
-        checkpointer.wait_until_finished()
-        mlflow.log_artifact(str(checkpoint_path / "state"), artifact_path="model")
         mlflow.log_artifact(str(checkpoint_path / "metrics.csv"), artifact_path="metrics")
         mlflow.log_artifact(str(checkpoint_path / "training.log"), artifact_path="logs")
 
