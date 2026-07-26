@@ -113,8 +113,8 @@ class TransformerBlock(nnx.Module):
 
 class ZeuxoModel(nnx.Module):
     def __init__(self, rngs: nnx.Rngs):
-        # shared feature transformer applied to each perspective independently
-        self.embedding = nnx.Embed(N_PIECE_TYPES, MODEL_WIDTH-N_SQUARES, rngs=rngs)
+        self.piece_embedding = nnx.Embed(N_PIECE_TYPES, MODEL_WIDTH, rngs=rngs)
+        self.positional_embedding = nnx.Embed(N_SQUARES, MODEL_WIDTH, rngs=rngs)
 
         self.blocks = [
             TransformerBlock(rngs=rngs, c_dtype=jnp.bfloat16, n_dtype=jnp.float32) for _ in range(MODEL_LAYERS)
@@ -126,8 +126,8 @@ class ZeuxoModel(nnx.Module):
     def __call__(self, tokens: jax.Array) -> jax.Array:
         assert tokens.ndim == 2 and tokens.shape[1] == N_SQUARES # (batch, 64)
 
-        pos = jnp.broadcast_to(jax.nn.one_hot(jnp.arange(N_SQUARES), N_SQUARES), (tokens.shape[0], N_SQUARES, N_SQUARES)) # (batch, 64, 64)
-        x = jnp.concatenate([self.embedding(tokens), pos], axis=-1)
+        # pos = jnp.broadcast_to(jax.nn.one_hot(jnp.arange(N_SQUARES), N_SQUARES), (tokens.shape[0], N_SQUARES, N_SQUARES)) # (batch, 64, 64)
+        x = self.piece_embedding(tokens) + self.positional_embedding(jnp.arange(N_SQUARES)) # (batch, 64, MODEL_WIDTH)
 
         for block in self.blocks:
             x = block(x) # (batch, 64, MODEL_WIDTH)
