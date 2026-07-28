@@ -5,8 +5,8 @@ description = "Editor/dev environment for zeuxo training. Runtime deps live inli
 readme = "../README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "jax~=0.6.0",
-    "flax~=0.10.6",
+    "jax~=0.11.0",
+    "flax~=0.12.8",
     "optax",
     "orbax",
     "pandas",

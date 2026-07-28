@@ -1,8 +1,8 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#    "jax[cuda12]~=0.6.0",
-#    "flax~=0.10.6",
+#    "jax[cuda12]~=0.11.0",
+#    "flax~=0.12.8",
 #    "optax",
 #    "orbax",
 #    "pandas",
@@ -40,9 +40,8 @@ logger = logging.getLogger(__name__)
 # --- board / feature geometry -------------------------------------------------
 N_SQUARES = 64
 N_PIECE_TYPES = 13  # pawn, knight, bishop, rook, queen, king per side (6*2) + empty (1) encoded as 0
-ASPECT_RATIO = 128 # Width of the residual stream per transformer block
-MODEL_LAYERS = 8 # How many transformer blocks to use; the single scale knob
-MODEL_WIDTH = ASPECT_RATIO * MODEL_LAYERS # Width of the residual stream
+MODEL_LAYERS = 8 # How many transformer blocks to use;
+MODEL_WIDTH = 1024 
 ATTENTION_WIDTH = 64 # Width of each attention head
 N_HEADS = MODEL_WIDTH // ATTENTION_WIDTH # How many attention heads to use in the transformer
 assert ATTENTION_WIDTH * N_HEADS == MODEL_WIDTH, "Attention width must divide model width evenly"
@@ -81,7 +80,7 @@ class Attention(nnx.Module):
         k = self.k(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
         v = self.v(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
 
-        attn = jax.nn.dot_product_attention(q, k, v, bias=None, is_causal=False, implementation="cudnn")
+        attn = jax.nn.dot_product_attention(q, k, v, implementation="xla") # cudnn poisons the gradients with nan
         o = self.o(attn.reshape(x.shape[0], x.shape[1], N_HEADS * ATTENTION_WIDTH))
         return o # (batch, seq_len, MODEL_WIDTH)
 
@@ -116,9 +115,9 @@ class ZeuxoModel(nnx.Module):
         self.piece_embedding = nnx.Embed(N_PIECE_TYPES, MODEL_WIDTH, rngs=rngs)
         self.positional_embedding = nnx.Embed(N_SQUARES, MODEL_WIDTH, rngs=rngs)
 
-        self.blocks = [
+        self.blocks = nnx.List([
             TransformerBlock(rngs=rngs, c_dtype=jnp.bfloat16, n_dtype=jnp.float32) for _ in range(MODEL_LAYERS)
-        ]
+        ])
         self.final_norm = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs, dtype=jnp.float32)
         self.head = nnx.Linear(MODEL_WIDTH, 1, use_bias=False, rngs=rngs, dtype=jnp.bfloat16)
 
@@ -149,7 +148,7 @@ def loss_fn(logits: jax.Array, labels: jax.Array) -> jax.Array:
 
 
 @nnx.jit
-def train_step(model: ZeuxoModel, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, batch: dict[str, jax.Array]):
+def train_step(model: ZeuxoModel, optimizer: nnx.ModelAndOptimizer, metrics: nnx.MultiMetric, batch: dict[str, jax.Array]):
     def loss(model: ZeuxoModel):
         return loss_fn(model(batch["features"]), batch["label"])
 
@@ -330,7 +329,7 @@ def main() -> None:
             return any(getattr(k, "key", None) == "kernel" or getattr(k, "name", None) == "kernel" for k in path)
         return jax.tree_util.tree_map_with_path(is_kernel, params)
 
-    optimizer = nnx.Optimizer(model, optax.adamw(schedule, mask=weight_decay_mask))
+    optimizer = nnx.ModelAndOptimizer(model, optax.adamw(schedule, mask=weight_decay_mask))
 
     train_metrics = nnx.MultiMetric(loss=nnx.metrics.Average("loss"))
     test_metrics = nnx.MultiMetric(
