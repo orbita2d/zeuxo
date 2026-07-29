@@ -5,8 +5,10 @@ resources:
   cloud: runpod
   disk_size: 200
 
-envs:
+secrets:
   TS_AUTHKEY:  # ephemeral tailscale key, populated from local env at launch
+
+envs:
   MLFLOW_TRACKING_URI: http://junebug:5000
   MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING: true
   MLFLOW_EXPERIMENT: zeuxo-training

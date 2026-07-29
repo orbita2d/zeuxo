@@ -40,8 +40,8 @@ logger = logging.getLogger(__name__)
 # --- board / feature geometry -------------------------------------------------
 N_SQUARES = 64
 N_PIECE_TYPES = 13  # pawn, knight, bishop, rook, queen, king per side (6*2) + empty (1) encoded as 0
-MODEL_LAYERS = 8 # How many transformer blocks to use;
-MODEL_WIDTH = 1024 
+MODEL_LAYERS = 16 # How many transformer blocks to use;
+MODEL_WIDTH = 512 
 ATTENTION_WIDTH = 64 # Width of each attention head
 N_HEADS = MODEL_WIDTH // ATTENTION_WIDTH # How many attention heads to use in the transformer
 assert ATTENTION_WIDTH * N_HEADS == MODEL_WIDTH, "Attention width must divide model width evenly"
@@ -51,8 +51,9 @@ LOGISTIC_SCALING = 400.0  # centipawns -> win prob via sigmoid(eval / scaling)
 EVAL_SAMPLES = 1 << 16  # fixed subsample of the test split, kept on device for periodic eval
 EVAL_SEED = 271828  # independent of SEED so the eval sample is identical across runs
 EVAL_FREQ_BOARDS = 1 << 21  # boards trained between in-loop evals (~1% eval overhead)
+CHECKPOINT_FREQ_BOARDS = int(os.environ.get("CHECKPOINT_FREQ_BOARDS", 1 << 25))  # boards between intermediate checkpoints; short runs only get the final one
 
-HYPERPARAM_LEARNING_RATE_PEAK = float(os.environ.get("HYPERPARAM_LEARNING_RATE_PEAK", 1e-3))
+HYPERPARAM_LEARNING_RATE_PEAK = float(os.environ.get("HYPERPARAM_LEARNING_RATE_PEAK", 4e-4))
 HYPERPARAM_LEARNING_RATE_END = float(os.environ.get("HYPERPARAM_LEARNING_RATE_END", 2e-6))
 HYPERPARAM_BATCH_SIZE_LOG = int(os.environ.get("HYPERPARAM_BATCH_SIZE_LOG", 10))  # 2^10 = 1024
 
@@ -329,7 +330,21 @@ def main() -> None:
             return any(getattr(k, "key", None) == "kernel" or getattr(k, "name", None) == "kernel" for k in path)
         return jax.tree_util.tree_map_with_path(is_kernel, params)
 
-    optimizer = nnx.ModelAndOptimizer(model, optax.adamw(schedule, mask=weight_decay_mask))
+    optimizer = nnx.ModelAndOptimizer(model, 
+                                      optax.chain(
+                                          optax.clip_by_global_norm(1.0),
+                                          optax.adamw(schedule, mask=weight_decay_mask, b2=0.99)
+                                          )
+                                      )
+
+    checkpointer = ocp.StandardCheckpointer()
+    checkpoint_freq = CHECKPOINT_FREQ_BOARDS // batch_size
+    checkpoint_dir = checkpoint_path / "checkpoints"
+    checkpoint_dir.mkdir()
+
+    def save_checkpoint(name: str):
+        checkpointer.save(checkpoint_dir / name, nnx.state(model, nnx.Param))
+        logger.info(f"Saved checkpoint {name}")
 
     train_metrics = nnx.MultiMetric(loss=nnx.metrics.Average("loss"))
     test_metrics = nnx.MultiMetric(
@@ -363,6 +378,7 @@ def main() -> None:
             "peak_lr": HYPERPARAM_LEARNING_RATE_PEAK,
             "end_lr": HYPERPARAM_LEARNING_RATE_END,
             "warmup_steps": warmup_steps,
+            "checkpoint_freq": checkpoint_freq,
             "training_samples": data_loader.samples("train"),
             "test_samples": data_loader.samples("test"),
         })
@@ -404,11 +420,19 @@ def main() -> None:
                     mlflow.log_metric(m, metrics_history[m][-1], step=step)
                 t_last = time.perf_counter()
 
+            if (step + 1) % checkpoint_freq == 0 and step + 1 < iterations:
+                t_ckpt = time.perf_counter()
+                save_checkpoint(f"step_{step:08d}")
+                t_last += time.perf_counter() - t_ckpt
+
             if step >= iterations - 1:
                 break
 
         logger.info(f"Training complete; mean step time {t_train_total / iterations:.3f}s "
                     f"({batch_size / (t_train_total / iterations):,.0f} boards/s)")
+        save_checkpoint("final")
+        checkpointer.wait_until_finished()
+        mlflow.log_artifacts(str(checkpoint_dir), artifact_path="checkpoints")
         # test_metrics.reset()
         # data_loader.clear_in_memory()
         # for test_batch in data_loader.batched(batch_size, dataset="test_remainder", repeat=False):
