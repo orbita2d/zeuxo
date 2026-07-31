@@ -21,7 +21,7 @@ import os
 from pathlib import Path
 import shutil
 import time
-from typing import Literal
+from typing import Literal, cast
 
 import jax
 from jax import numpy as jnp
@@ -53,6 +53,11 @@ EVAL_SEED = 271828  # independent of SEED so the eval sample is identical across
 EVAL_FREQ_BOARDS = 1 << 21  # boards trained between in-loop evals (~1% eval overhead)
 CHECKPOINT_FREQ_BOARDS = int(os.environ.get("CHECKPOINT_FREQ_BOARDS", 1 << 25))  # boards between intermediate checkpoints; short runs only get the final one
 
+CLIP_GRAD_NORM = 1.0
+ADAM_B2 = 0.99
+
+ATTENTION_IMPL = cast(Literal["xla", "cudnn"], os.environ.get("ATTENTION_IMPL", "xla"))  # cudnn NaN'd gradients on pre-clipping runs; retesting
+
 HYPERPARAM_LEARNING_RATE_PEAK = float(os.environ.get("HYPERPARAM_LEARNING_RATE_PEAK", 4e-4))
 HYPERPARAM_LEARNING_RATE_END = float(os.environ.get("HYPERPARAM_LEARNING_RATE_END", 2e-6))
 HYPERPARAM_BATCH_SIZE_LOG = int(os.environ.get("HYPERPARAM_BATCH_SIZE_LOG", 10))  # 2^10 = 1024
@@ -81,7 +86,7 @@ class Attention(nnx.Module):
         k = self.k(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
         v = self.v(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
 
-        attn = jax.nn.dot_product_attention(q, k, v, implementation="xla") # cudnn poisons the gradients with nan
+        attn = jax.nn.dot_product_attention(q, k, v, implementation=ATTENTION_IMPL)
         o = self.o(attn.reshape(x.shape[0], x.shape[1], N_HEADS * ATTENTION_WIDTH))
         return o # (batch, seq_len, MODEL_WIDTH)
 
@@ -155,7 +160,8 @@ def train_step(model: ZeuxoModel, optimizer: nnx.ModelAndOptimizer, metrics: nnx
 
     loss_val, grads = nnx.value_and_grad(loss)(model)
     optimizer.update(grads)
-    metrics.update(loss=loss_val)
+    gnorm = optax.global_norm(grads)
+    metrics.update(loss=loss_val, grad_norm=gnorm, grad_clipped=(gnorm > CLIP_GRAD_NORM).astype(jnp.float32))
 
 
 @nnx.jit
@@ -216,7 +222,7 @@ class FileSource:
             logger.info(f"{split:>10} samples: {self.samples(split):>12,}")
 
         cols = ["features", "eval"]
-        self._training_data = self.ds.head(
+        self._training_data: pa.Table | None = self.ds.head(
             self.samples("train"), columns=cols, filter=pds.field("setType") == "train"
         ).combine_chunks()
         test_table = self.ds.head(
@@ -259,7 +265,7 @@ class FileSource:
 
     def _batched_lazy(self, batch_size: int, *, dataset: str, repeat: bool):
         if dataset == "train":
-            chunk = self._training_data
+            chunk = cast(pa.Table, self._training_data)
         elif dataset == "test_remainder":
             chunk = self._test_remainder
         elif dataset == "validation":
@@ -332,8 +338,8 @@ def main() -> None:
 
     optimizer = nnx.ModelAndOptimizer(model, 
                                       optax.chain(
-                                          optax.clip_by_global_norm(1.0),
-                                          optax.adamw(schedule, mask=weight_decay_mask, b2=0.99)
+                                          optax.clip_by_global_norm(CLIP_GRAD_NORM),
+                                          optax.adamw(schedule, mask=weight_decay_mask, b2=ADAM_B2)
                                           )
                                       )
 
@@ -346,7 +352,11 @@ def main() -> None:
         checkpointer.save(checkpoint_dir / name, nnx.state(model, nnx.Param))
         logger.info(f"Saved checkpoint {name}")
 
-    train_metrics = nnx.MultiMetric(loss=nnx.metrics.Average("loss"))
+    train_metrics = nnx.MultiMetric(
+        loss=nnx.metrics.Average("loss"),
+        grad_norm=nnx.metrics.Average("grad_norm"),
+        grad_clipped=nnx.metrics.Average("grad_clipped"),
+    )
     test_metrics = nnx.MultiMetric(
         loss=nnx.metrics.Average("loss"),
         winning_ratio=nnx.metrics.Average("winning_ratio"),
@@ -377,6 +387,9 @@ def main() -> None:
             "logistic_scaling": LOGISTIC_SCALING,
             "peak_lr": HYPERPARAM_LEARNING_RATE_PEAK,
             "end_lr": HYPERPARAM_LEARNING_RATE_END,
+            "clip_grad_norm": CLIP_GRAD_NORM,
+            "adam_b2": ADAM_B2,
+            "attention_impl": ATTENTION_IMPL,
             "warmup_steps": warmup_steps,
             "checkpoint_freq": checkpoint_freq,
             "training_samples": data_loader.samples("train"),
@@ -414,7 +427,7 @@ def main() -> None:
                     f.write(f"{step},{epoch:.5f}," + ",".join(str(metrics_history[m][-1]) for m in metrics_history) + "\n")
                 mlflow.log_metric("epoch", epoch, step=step)
                 mlflow.log_metric("boards", step * batch_size, step=step)
-                mlflow.log_metric("learning_rate", float(schedule(step)), step=step)
+                mlflow.log_metric("learning_rate", float(cast(jax.Array, schedule(step))), step=step)
                 mlflow.log_metric("boards_per_second", batch_size / step_time, step=step)
                 for m in metrics_history:
                     mlflow.log_metric(m, metrics_history[m][-1], step=step)

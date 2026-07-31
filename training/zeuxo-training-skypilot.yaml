@@ -14,6 +14,7 @@ envs:
   MLFLOW_EXPERIMENT: zeuxo-training
   TRAIN_BOARDS:  # boards-seen budget, set at launch (e.g. 280000000 for ~12h on H200)
   HYPERPARAM_BATCH_SIZE_LOG: 10  # batch size = 2^this
+  ATTENTION_IMPL: xla
   TRAIN_FILE: /datasets/chess-data
   CHECKPOINT_PATH: /checkpoints
 
