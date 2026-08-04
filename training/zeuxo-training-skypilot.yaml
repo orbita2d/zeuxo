@@ -13,14 +13,16 @@ envs:
   MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING: true
   MLFLOW_EXPERIMENT: zeuxo-training
   TRAIN_BOARDS:  # boards-seen budget, set at launch (e.g. 280000000 for ~12h on H200)
-  HYPERPARAM_BATCH_SIZE_LOG: 10  # batch size = 2^this
-  ATTENTION_IMPL: xla
+  HYPERPARAM_BATCH_SIZE_LOG: 12  # batch size = 2^this
+  HYPERPARAM_LEARNING_RATE_PEAK: 4e-4
+  HYPERPARAM_LEARNING_RATE_END: 2e-6
+  ATTENTION_IMPL: cudnn
   TRAIN_FILE: /datasets/chess-data
   CHECKPOINT_PATH: /checkpoints
 
 file_mounts:
   /datasets/chess-data:
-    source: r2://chess-stuff/data-2026-06-06  # TODO: point at zeuxo's dataset
+    source: r2://chess-stuff/zeuxo-data-2026-08-03
     mode: COPY
 
   ~/training.py: ./training.py
@@ -33,15 +35,19 @@ setup: |
 run: |
   set -euo pipefail
 
-  tailscaled \
-    --tun=userspace-networking \
-    --socks5-server=localhost:1055 \
-    --outbound-http-proxy-listen=localhost:1055 \
-    > /tmp/tailscaled.log 2>&1 &
+  if ! pgrep -x tailscaled > /dev/null; then
+    tailscaled \
+      --tun=userspace-networking \
+      --socks5-server=localhost:1055 \
+      --outbound-http-proxy-listen=localhost:1055 \
+      > /tmp/tailscaled.log 2>&1 &
+  fi
 
   until [ -S /var/run/tailscale/tailscaled.sock ]; do sleep 0.2; done
 
-  tailscale up --authkey="${TS_AUTHKEY}" --hostname="skypilot-$(hostname)"
+  if ! tailscale status > /dev/null 2>&1; then
+    tailscale up --authkey="${TS_AUTHKEY}" --hostname="skypilot-$(hostname)"
+  fi
   tailscale status
 
   # Route mlflow traffic over the tailnet; keep PyPI fetches direct so uv install isn't proxied

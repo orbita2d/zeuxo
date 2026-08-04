@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 # --- board / feature geometry -------------------------------------------------
 N_SQUARES = 64
-N_PIECE_TYPES = 13  # pawn, knight, bishop, rook, queen, king per side (6*2) + empty (1) encoded as 0
+N_PIECE_TYPES = 16  # 0 empty, 1 ep-capturable pawn, then our/their pawn..king with separate castling-rook tokens (see data/Encoding.scala)
 MODEL_LAYERS = 16 # How many transformer blocks to use;
 MODEL_WIDTH = 512 
 ATTENTION_WIDTH = 64 # Width of each attention head
@@ -49,14 +49,16 @@ assert ATTENTION_WIDTH * N_HEADS == MODEL_WIDTH, "Attention width must divide mo
 LOGISTIC_SCALING = 400.0  # centipawns -> win prob via sigmoid(eval / scaling)
 
 EVAL_SAMPLES = 1 << 16  # fixed subsample of the test split, kept on device for periodic eval
+EVAL_POOL_SAMPLES = 1 << 22  # test rows the eval sample is permuted out of (head alone would be sequential positions from the same games)
 EVAL_SEED = 271828  # independent of SEED so the eval sample is identical across runs
+MAX_TRAIN_SAMPLES = 300_000_000  # cap on train rows materialised in RAM
 EVAL_FREQ_BOARDS = 1 << 21  # boards trained between in-loop evals (~1% eval overhead)
 CHECKPOINT_FREQ_BOARDS = int(os.environ.get("CHECKPOINT_FREQ_BOARDS", 1 << 25))  # boards between intermediate checkpoints; short runs only get the final one
 
 CLIP_GRAD_NORM = 1.0
 ADAM_B2 = 0.99
 
-ATTENTION_IMPL = cast(Literal["xla", "cudnn"], os.environ.get("ATTENTION_IMPL", "xla"))  # cudnn NaN'd gradients on pre-clipping runs; retesting
+ATTENTION_IMPL = cast(Literal["xla", "cudnn"], os.environ.get("ATTENTION_IMPL", "cudnn"))
 
 HYPERPARAM_LEARNING_RATE_PEAK = float(os.environ.get("HYPERPARAM_LEARNING_RATE_PEAK", 4e-4))
 HYPERPARAM_LEARNING_RATE_END = float(os.environ.get("HYPERPARAM_LEARNING_RATE_END", 2e-6))
@@ -175,32 +177,9 @@ def eval_step(model: ZeuxoModel, metrics: nnx.MultiMetric, batch: dict[str, jax.
     )
 
 
-@jax.jit
-def unpack_features(features: jax.Array) -> dict[str, jax.Array]:
-    """
-    Turn a (batch, 64) board of piece codes into our feature representation for the model.
-
-    Input Encoding:
-      0    -> empty square
-      1..5   -> our pawn..queen,   6  -> our king
-      9..13  -> their pawn..queen, 14 -> their king
-    
-      From movers (our) perspective
-    Output Encoding:
-        0 -> empty square
-        1..5 -> our pawn..queen
-        6 -> our king
-        7..11 -> their pawn..queen
-        12 -> their king
-    """
-    transformed = jnp.where(features > 7, features - 2, features)
-
-    return {"features": transformed}
-
-
 class FileSource:
     """
-    Parquet-backed loader partitioned on setType={train,test,validation}.
+    Parquet-backed loader partitioned on setType={train,test}.
     Schema: features (list<int8>[64]), eval (int32), setType (string).
     """
 
@@ -218,26 +197,26 @@ class FileSource:
         self.logistic_scaling = logistic_scaling
 
         logger.info(f"Initialised {self.ds.count_rows():,} rows from {path}")
-        for split in ("train", "test", "validation"):
+        for split in ("train", "test"):
             logger.info(f"{split:>10} samples: {self.samples(split):>12,}")
 
         cols = ["features", "eval"]
         self._training_data: pa.Table | None = self.ds.head(
-            self.samples("train"), columns=cols, filter=pds.field("setType") == "train"
+            min(self.samples("train"), MAX_TRAIN_SAMPLES), columns=cols, filter=pds.field("setType") == "train"
         ).combine_chunks()
-        test_table = self.ds.head(
-            self.samples("test"), columns=cols, filter=pds.field("setType") == "test"
-        ).combine_chunks()
-        perm = np.random.default_rng(EVAL_SEED).permutation(test_table.num_rows)
-        self.ds_jax = {"test": self.load_to_device(test_table.take(perm[:EVAL_SAMPLES]))}
-        self._test_remainder = test_table.take(perm[EVAL_SAMPLES:])
-        logger.info(f"Eval sample of {EVAL_SAMPLES:,} test boards on device {self.ds_jax['test']['features'].device}; "
-                    f"{self._test_remainder.num_rows:,} boards held back for the final sweep")
+        self.train_rows = self._training_data.num_rows
+        test_pool = self.ds.head(
+            EVAL_POOL_SAMPLES, columns=cols, filter=pds.field("setType") == "test"
+        )
+        perm = np.random.default_rng(EVAL_SEED).permutation(test_pool.num_rows)
+        self.ds_jax = {"test": self.load_to_device(test_pool.take(perm[:EVAL_SAMPLES]))}
+        logger.info(f"Loaded {self.train_rows:,} train boards to ram; "
+                    f"eval sample of {EVAL_SAMPLES:,} test boards on device {self.ds_jax['test']['features'].device}")
 
     def __len__(self):
         return self.ds.count_rows()
 
-    def samples(self, dataset: Literal["test", "train", "validation"]) -> int:
+    def samples(self, dataset: Literal["test", "train"]) -> int:
         return self.ds.count_rows(filter=pds.field("setType") == dataset)
 
     def load_to_device(self, table: pa.Table) -> dict[str, jax.Array]:
@@ -248,43 +227,32 @@ class FileSource:
         }
         return jax.device_put(arr, device=jax.devices()[0])
 
-    def batched(self, batch_size: int, *, dataset: Literal["test", "test_remainder", "train", "validation"], repeat: bool = True):
+    def batched(self, batch_size: int, *, dataset: Literal["test", "train"], repeat: bool = True):
         if dataset == "test":
             yield from self._batched_from_device(batch_size, dataset="test") # test set is already on device
         else:
-            yield from self._batched_lazy(batch_size, dataset=dataset, repeat=repeat) # train and validation sets are loaded lazily from ram or disk.
+            yield from self._batched_lazy(batch_size, dataset=dataset, repeat=repeat) # train is loaded lazily from ram
 
     def _batched_from_device(self, batch_size: int, dataset: str):
         ds = self.ds_jax[dataset]
         chunk_len = len(ds["features"])
         for i in range(0, chunk_len - batch_size + 1, batch_size):
             yield {
-                **unpack_features(ds["features"][i:i + batch_size]),
+                "features": ds["features"][i:i + batch_size],
                 "label": ds["label"][i:i + batch_size],
             }
 
     def _batched_lazy(self, batch_size: int, *, dataset: str, repeat: bool):
-        if dataset == "train":
-            chunk = cast(pa.Table, self._training_data)
-        elif dataset == "test_remainder":
-            chunk = self._test_remainder
-        elif dataset == "validation":
-            chunk = self.ds.head(self.samples("validation"), columns=["features", "eval"], filter=pds.field("setType") == "validation")
-        else:
-            raise ValueError(dataset)
+        assert dataset == "train", dataset
+        chunk = cast(pa.Table, self._training_data)
 
         rng = np.random.default_rng(SEED)
         while True:
-            perm = rng.permutation(chunk.num_rows) if dataset == "train" else None
+            perm = rng.permutation(chunk.num_rows)
             for i in range(0, chunk.num_rows - batch_size + 1, batch_size):
-                batch = chunk.take(perm[i:i + batch_size]) if perm is not None else chunk.slice(offset=i, length=batch_size)
-                arr = self.load_to_device(batch)
-                yield {**unpack_features(arr["features"]), "label": arr["label"]}
+                yield self.load_to_device(chunk.take(perm[i:i + batch_size]))
             if not repeat:
                 break
-
-    def clear_in_memory(self):
-        self._training_data = None
 
 
 def main() -> None:
@@ -318,7 +286,7 @@ def main() -> None:
     data_loader = FileSource(train_file, LOGISTIC_SCALING)
 
     validation_freq = EVAL_FREQ_BOARDS // batch_size
-    steps_per_epoch = (len(data_loader) - 1) // batch_size + 1
+    steps_per_epoch = (data_loader.train_rows - 1) // batch_size + 1
 
     model = ZeuxoModel(rngs=nnx.Rngs(SEED))
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(model, nnx.Param)))
@@ -392,7 +360,7 @@ def main() -> None:
             "attention_impl": ATTENTION_IMPL,
             "warmup_steps": warmup_steps,
             "checkpoint_freq": checkpoint_freq,
-            "training_samples": data_loader.samples("train"),
+            "training_samples": data_loader.train_rows,
             "test_samples": data_loader.samples("test"),
         })
         mlflow.set_tag("device", jax.devices()[0].device_kind)
@@ -446,13 +414,6 @@ def main() -> None:
         save_checkpoint("final")
         checkpointer.wait_until_finished()
         mlflow.log_artifacts(str(checkpoint_dir), artifact_path="checkpoints")
-        # test_metrics.reset()
-        # data_loader.clear_in_memory()
-        # for test_batch in data_loader.batched(batch_size, dataset="test_remainder", repeat=False):
-        #     eval_step(model, test_metrics, test_batch)
-        # for m, v in test_metrics.compute().items():
-        #     logger.info(f"test_remainder {m}: {float(v):.5f}")
-        #     mlflow.log_metric(f"test_remainder_{m}", float(v), step=iterations)
 
         mlflow.log_artifact(str(checkpoint_path / "metrics.csv"), artifact_path="metrics")
         mlflow.log_artifact(str(checkpoint_path / "training.log"), artifact_path="logs")
