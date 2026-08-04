@@ -1,0 +1,8 @@
+<configuration>
+    <logger name="org.apache.parquet" level="WARN"/>
+        <logger name="org.apache.parquet.io.MessageColumnIO" level="WARN"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

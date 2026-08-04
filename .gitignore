@@ -11,6 +11,11 @@ checkpoints/
 *.log
 *.gen
 
+# scala / sbt
+target/
+.bsp/
+.metals/
+
 # engine build artifacts
 *.exe
 *.dll
