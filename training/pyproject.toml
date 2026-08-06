@@ -19,4 +19,5 @@ dependencies = [
     "pynvml",
     "ipykernel",
     "skypilot[runpod]>=0.13.0",
+    "grain>=0.2.18",
 ]

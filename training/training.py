@@ -3,6 +3,7 @@
 # dependencies = [
 #    "jax[cuda12]~=0.11.0",
 #    "flax~=0.12.8",
+#    "grain==0.2.18",
 #    "optax",
 #    "orbax",
 #    "pandas",
@@ -17,15 +18,19 @@
 # ///
 
 import logging
+import math
 import os
 from pathlib import Path
+import random
 import shutil
 import time
 from typing import Literal, cast
 
 import jax
 from jax import numpy as jnp
+import grain
 import numpy as np
+from scipy.special import expit
 import flax
 from flax import nnx
 import optax
@@ -34,6 +39,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as pds
 import mlflow
+import absl.flags
 
 logger = logging.getLogger(__name__)
 
@@ -77,16 +83,13 @@ CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH")
 
 class Attention(nnx.Module):
     def __init__(self, rngs: nnx.Rngs, c_dtype=jnp.bfloat16):
-        self.q = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs, dtype=c_dtype)
-        self.k = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs, dtype=c_dtype)
-        self.v = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS, use_bias=False, rngs=rngs, dtype=c_dtype)
+        self.qkv = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS * 3, use_bias=False, rngs=rngs, dtype=c_dtype)
         self.o = nnx.Linear(ATTENTION_WIDTH * N_HEADS, MODEL_WIDTH, use_bias=False, rngs=rngs, dtype=c_dtype)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: (batch, seq_len, MODEL_WIDTH)
-        q = self.q(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
-        k = self.k(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
-        v = self.v(x).reshape(x.shape[0], x.shape[1], N_HEADS, ATTENTION_WIDTH)
+        qkv = self.qkv(x).reshape(x.shape[0], x.shape[1], N_HEADS, 3 * ATTENTION_WIDTH)
+        q, k, v = jnp.split(qkv, 3, axis=-1)
 
         attn = jax.nn.dot_product_attention(q, k, v, implementation=ATTENTION_IMPL)
         o = self.o(attn.reshape(x.shape[0], x.shape[1], N_HEADS * ATTENTION_WIDTH))
@@ -177,82 +180,25 @@ def eval_step(model: ZeuxoModel, metrics: nnx.MultiMetric, batch: dict[str, jax.
     )
 
 
-class FileSource:
-    """
-    Parquet-backed loader partitioned on setType={train,test}.
-    Schema: features (list<int8>[64]), eval (int32), setType (string).
-    """
-
-    def __init__(self, path: Path, logistic_scaling: float):
-        feature_length = N_SQUARES
-        schema = pa.schema([
-            pa.field("features", pa.list_(pa.int8(), feature_length)),
-            pa.field("eval", pa.int32()),
-            pa.field("setType", pa.string()),
-        ])
-        partition = pds.partitioning(pa.schema([pa.field("setType", pa.string(), nullable=False)]), flavor="hive")
-
-        self.ds = pds.dataset(path, partitioning=partition, schema=schema)
-        self.path = path
-        self.logistic_scaling = logistic_scaling
-
-        logger.info(f"Initialised {self.ds.count_rows():,} rows from {path}")
-        for split in ("train", "test"):
-            logger.info(f"{split:>10} samples: {self.samples(split):>12,}")
-
-        cols = ["features", "eval"]
-        self._training_data: pa.Table | None = self.ds.head(
-            min(self.samples("train"), MAX_TRAIN_SAMPLES), columns=cols, filter=pds.field("setType") == "train"
-        ).combine_chunks()
-        self.train_rows = self._training_data.num_rows
-        test_pool = self.ds.head(
-            EVAL_POOL_SAMPLES, columns=cols, filter=pds.field("setType") == "test"
-        )
-        perm = np.random.default_rng(EVAL_SEED).permutation(test_pool.num_rows)
-        self.ds_jax = {"test": self.load_to_device(test_pool.take(perm[:EVAL_SAMPLES]))}
-        logger.info(f"Loaded {self.train_rows:,} train boards to ram; "
-                    f"eval sample of {EVAL_SAMPLES:,} test boards on device {self.ds_jax['test']['features'].device}")
-
-    def __len__(self):
-        return self.ds.count_rows()
-
-    def samples(self, dataset: Literal["test", "train"]) -> int:
-        return self.ds.count_rows(filter=pds.field("setType") == dataset)
-
-    def load_to_device(self, table: pa.Table) -> dict[str, jax.Array]:
-        features = jnp.from_dlpack(table.column("features").combine_chunks().values).reshape(-1, 64)
-        arr = {
-            "features": features,
-            "label": normalise_eval(jnp.from_dlpack(table.column("eval").combine_chunks()), self.logistic_scaling),
-        }
-        return jax.device_put(arr, device=jax.devices()[0])
-
-    def batched(self, batch_size: int, *, dataset: Literal["test", "train"], repeat: bool = True):
-        if dataset == "test":
-            yield from self._batched_from_device(batch_size, dataset="test") # test set is already on device
-        else:
-            yield from self._batched_lazy(batch_size, dataset=dataset, repeat=repeat) # train is loaded lazily from ram
-
-    def _batched_from_device(self, batch_size: int, dataset: str):
-        ds = self.ds_jax[dataset]
-        chunk_len = len(ds["features"])
-        for i in range(0, chunk_len - batch_size + 1, batch_size):
-            yield {
-                "features": ds["features"][i:i + batch_size],
-                "label": ds["label"][i:i + batch_size],
-            }
-
-    def _batched_lazy(self, batch_size: int, *, dataset: str, repeat: bool):
-        assert dataset == "train", dataset
-        chunk = cast(pa.Table, self._training_data)
-
-        rng = np.random.default_rng(SEED)
-        while True:
-            perm = rng.permutation(chunk.num_rows)
-            for i in range(0, chunk.num_rows - batch_size + 1, batch_size):
-                yield self.load_to_device(chunk.take(perm[i:i + batch_size]))
-            if not repeat:
-                break
+def load_test_data(path: Path) -> tuple[dict[str, jax.Array], int]:
+    # eval sample must stay bit-identical to the old FileSource one: same scan order, permutation and device layout
+    schema = pa.schema([
+        pa.field("features", pa.list_(pa.int8(), N_SQUARES)),
+        pa.field("eval", pa.int32()),
+        pa.field("setType", pa.string()),
+    ])
+    partition = pds.partitioning(pa.schema([pa.field("setType", pa.string(), nullable=False)]), flavor="hive")
+    ds = pds.dataset(path, partitioning=partition, schema=schema)
+    test_rows = ds.count_rows(filter=pds.field("setType") == "test")
+    pool = ds.head(EVAL_POOL_SAMPLES, columns=["features", "eval"], filter=pds.field("setType") == "test")
+    perm = np.random.default_rng(EVAL_SEED).permutation(pool.num_rows)
+    sample = pool.take(perm[:EVAL_SAMPLES])
+    data = jax.device_put({
+        "features": jnp.from_dlpack(sample.column("features").combine_chunks().values).reshape(-1, N_SQUARES),
+        "label": normalise_eval(jnp.from_dlpack(sample.column("eval").combine_chunks()), LOGISTIC_SCALING),
+    }, device=jax.devices()[0])
+    logger.info(f"Eval sample of {len(data['label']):,} test boards (pool {pool.num_rows:,} of {test_rows:,}) on device {data['features'].device}")
+    return data, test_rows
 
 
 def main() -> None:
@@ -283,10 +229,32 @@ def main() -> None:
     script_path = Path(__file__).resolve()
     shutil.copy2(script_path, checkpoint_path / script_path.name)
 
-    data_loader = FileSource(train_file, LOGISTIC_SCALING)
+    training_samples = [ str(p.absolute()) for p in train_file.glob("setType=train/*.parquet") ]
+    random.Random(SEED).shuffle(training_samples)
+    train_rows = pds.dataset(training_samples).count_rows()
+    epochs = math.ceil(train_boards / train_rows)
+    dataset = (grain.experimental.WindowShuffleIterDataset(
+        grain.experimental.ParquetIterDataset(training_samples * epochs),
+        window_size=1<<23,
+        seed = SEED
+        )
+        .batch(batch_size, drop_remainder=True)
+        .map(lambda batch: {
+            "features": batch["features"],
+            "label": expit(batch["eval"].astype(np.float32) / LOGISTIC_SCALING),
+        })
+        .mp_prefetch(grain.MultiprocessingOptions(num_workers=4))
+    )
+    logger.info(f"Train pipeline: {len(training_samples)} files, {train_rows:,} rows, {epochs} epoch(s)")
+
+    test_data, test_rows = load_test_data(train_file)
+
+    def test_batches():
+        for i in range(0, len(test_data["label"]) - batch_size + 1, batch_size):
+            yield {k: v[i:i + batch_size] for k, v in test_data.items()}
 
     validation_freq = EVAL_FREQ_BOARDS // batch_size
-    steps_per_epoch = (data_loader.train_rows - 1) // batch_size + 1
+    steps_per_epoch = (train_rows - 1) // batch_size + 1
 
     model = ZeuxoModel(rngs=nnx.Rngs(SEED))
     n_params = sum(x.size for x in jax.tree_util.tree_leaves(nnx.state(model, nnx.Param)))
@@ -305,11 +273,11 @@ def main() -> None:
         return jax.tree_util.tree_map_with_path(is_kernel, params)
 
     optimizer = nnx.ModelAndOptimizer(model, 
-                                      optax.chain(
-                                          optax.clip_by_global_norm(CLIP_GRAD_NORM),
-                                          optax.adamw(schedule, mask=weight_decay_mask, b2=ADAM_B2)
-                                          )
-                                      )
+        optax.chain(
+            optax.clip_by_global_norm(CLIP_GRAD_NORM),
+            optax.adamw(schedule, mask=weight_decay_mask, b2=ADAM_B2)
+            )
+        )
 
     checkpointer = ocp.StandardCheckpointer()
     checkpoint_freq = CHECKPOINT_FREQ_BOARDS // batch_size
@@ -360,8 +328,8 @@ def main() -> None:
             "attention_impl": ATTENTION_IMPL,
             "warmup_steps": warmup_steps,
             "checkpoint_freq": checkpoint_freq,
-            "training_samples": data_loader.train_rows,
-            "test_samples": data_loader.samples("test"),
+            "training_samples": train_rows,
+            "test_samples": test_rows,
         })
         mlflow.set_tag("device", jax.devices()[0].device_kind)
         mlflow.log_artifact(str(script_path), artifact_path="code")
@@ -370,7 +338,7 @@ def main() -> None:
         t_last = time.perf_counter()
         t_train_total = 0.0
         last_timed_step = -1
-        for step, batch in enumerate(data_loader.batched(batch_size, dataset="train")):
+        for step, batch in enumerate(dataset):
             train_step(model, optimizer, train_metrics, batch)
 
             if step % validation_freq == 0 or step == iterations - 1:
@@ -382,7 +350,7 @@ def main() -> None:
                 for m, v in train_metrics.compute().items():
                     metrics_history[f"train_{m}"].append(float(v))
                 train_metrics.reset()
-                for test_batch in data_loader.batched(batch_size, dataset="test", repeat=False):
+                for test_batch in test_batches():
                     eval_step(model, test_metrics, test_batch)
                 for m, v in test_metrics.compute().items():
                     metrics_history[f"test_{m}"].append(float(v))
@@ -422,4 +390,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    absl.flags.FLAGS.mark_as_parsed()  # avoid absl flag parsing errors when running as a script
     main()
