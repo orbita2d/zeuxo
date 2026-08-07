@@ -83,15 +83,17 @@ CHECKPOINT_PATH = os.environ.get("CHECKPOINT_PATH")
 
 class Attention(nnx.Module):
     def __init__(self, rngs: nnx.Rngs, c_dtype=jnp.bfloat16):
+        self.c_dtype = c_dtype
         self.qkv = nnx.Linear(MODEL_WIDTH, ATTENTION_WIDTH * N_HEADS * 3, use_bias=False, rngs=rngs, dtype=c_dtype)
         self.o = nnx.Linear(ATTENTION_WIDTH * N_HEADS, MODEL_WIDTH, use_bias=False, rngs=rngs, dtype=c_dtype)
+        self.bias = nnx.Param(jnp.zeros((N_HEADS, N_SQUARES, N_SQUARES)), name="bias")
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: (batch, seq_len, MODEL_WIDTH)
         qkv = self.qkv(x).reshape(x.shape[0], x.shape[1], N_HEADS, 3 * ATTENTION_WIDTH)
         q, k, v = jnp.split(qkv, 3, axis=-1)
 
-        attn = jax.nn.dot_product_attention(q, k, v, implementation=ATTENTION_IMPL)
+        attn = jax.nn.dot_product_attention(q, k, v, bias=self.bias.value.astype(self.c_dtype), implementation=ATTENTION_IMPL)
         o = self.o(attn.reshape(x.shape[0], x.shape[1], N_HEADS * ATTENTION_WIDTH))
         return o # (batch, seq_len, MODEL_WIDTH)
 
@@ -245,7 +247,7 @@ def main() -> None:
         })
         .mp_prefetch(grain.MultiprocessingOptions(num_workers=4))
     )
-    
+
     logger.info(f"Train pipeline: {len(training_samples)} files, {train_rows:,} rows, {epochs} epoch(s)")
 
     test_data, test_rows = load_test_data(train_file)
