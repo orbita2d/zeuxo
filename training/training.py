@@ -17,6 +17,7 @@
 #   ]
 # ///
 
+import argparse
 import logging
 import math
 import os
@@ -49,8 +50,8 @@ N_PIECE_TYPES = 16  # 0 empty, 1 ep-capturable pawn, then our/their pawn..king w
 MODEL_LAYERS = 16 # How many transformer blocks to use;
 MODEL_WIDTH = 512 
 ATTENTION_WIDTH = 64 # Width of each attention head
-N_HEADS = MODEL_WIDTH // ATTENTION_WIDTH # How many attention heads to use in the transformer
-assert ATTENTION_WIDTH * N_HEADS == MODEL_WIDTH, "Attention width must divide model width evenly"
+N_HEADS = 16 # How many attention heads to use in the transformer
+MLP_WIDTH = MODEL_WIDTH * 2 # Hidden width of the MLP blocks
 
 LOGISTIC_SCALING = 400.0  # centipawns -> win prob via sigmoid(eval / scaling)
 
@@ -100,8 +101,8 @@ class Attention(nnx.Module):
 
 class MLP(nnx.Module):
     def __init__(self, rngs: nnx.Rngs, c_dtype=jnp.bfloat16):
-        self.fc1 = nnx.Linear(MODEL_WIDTH, MODEL_WIDTH * 4, use_bias=False, rngs=rngs, dtype=c_dtype)
-        self.fc2 = nnx.Linear(MODEL_WIDTH * 4, MODEL_WIDTH, use_bias=False, rngs=rngs, dtype=c_dtype)
+        self.fc1 = nnx.Linear(MODEL_WIDTH, MLP_WIDTH, use_bias=False, rngs=rngs, dtype=c_dtype)
+        self.fc2 = nnx.Linear(MLP_WIDTH, MODEL_WIDTH, use_bias=False, rngs=rngs, dtype=c_dtype)
         
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: (batch, seq_len, MODEL_WIDTH)
@@ -201,6 +202,25 @@ def load_test_data(path: Path) -> tuple[dict[str, jax.Array], int]:
     }, device=jax.devices()[0])
     logger.info(f"Eval sample of {len(data['label']):,} test boards (pool {pool.num_rows:,} of {test_rows:,}) on device {data['features'].device}")
     return data, test_rows
+
+
+def model_info() -> None:
+    model = ZeuxoModel(rngs=nnx.Rngs(SEED))
+    flat = nnx.state(model, nnx.Param).flat_state()
+    n_params = sum(v.size for _, v in flat)
+    print(f"ZeuxoModel: width {MODEL_WIDTH}, layers {MODEL_LAYERS}, {N_HEADS} heads x {ATTENTION_WIDTH}")
+    print(f"Total parameters: {n_params:,}\n")
+    by_top: dict[str, int] = {}
+    for path, v in flat:
+        top = str(path[0])
+        by_top[top] = by_top.get(top, 0) + v.size
+    for top, size in by_top.items():
+        print(f"  {top:<24} {size:>12,}  ({size / n_params:.1%})")
+    print("\nblocks[0]:")
+    for path, v in flat:
+        if path[:2] == ("blocks", 0):
+            name = ".".join(str(k) for k in path[2:])
+            print(f"  {name:<24} {str(v.shape):>14}  {v.dtype}  {v.size:>10,}")
 
 
 def main() -> None:
@@ -319,6 +339,8 @@ def main() -> None:
             "model_width": MODEL_WIDTH,
             "model_layers": MODEL_LAYERS,
             "n_heads": N_HEADS,
+            "attention_width": ATTENTION_WIDTH,
+            "mlp_width": MLP_WIDTH,
             "train_boards": train_boards,
             "iterations": iterations,
             "batch_size": batch_size,
@@ -394,4 +416,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     absl.flags.FLAGS.mark_as_parsed()  # avoid absl flag parsing errors when running as a script
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-info", action="store_true", help="build the model, print a parameter summary, and exit; needs no dataset and writes nothing")
+    if parser.parse_args().model_info:
+        model_info()
+    else:
+        main()
