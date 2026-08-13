@@ -39,6 +39,7 @@ import orbax.checkpoint as ocp
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as pds
+import pyarrow.parquet as pq
 import mlflow
 import absl.flags
 
@@ -49,8 +50,8 @@ N_SQUARES = 64
 N_PIECE_TYPES = 16  # 0 empty, 1 ep-capturable pawn, then our/their pawn..king with separate castling-rook tokens (see data/Encoding.scala)
 MODEL_LAYERS = 16 # How many transformer blocks to use;
 MODEL_WIDTH = 512 
-ATTENTION_WIDTH = 64 # Width of each attention head
-N_HEADS = 16 # How many attention heads to use in the transformer
+ATTENTION_WIDTH = 32 # Width of each attention head
+N_HEADS = 32 # How many attention heads to use in the transformer
 MLP_WIDTH = MODEL_WIDTH * 2 # Hidden width of the MLP blocks
 
 LOGISTIC_SCALING = 400.0  # centipawns -> win prob via sigmoid(eval / scaling)
@@ -129,9 +130,12 @@ class ZeuxoModel(nnx.Module):
         self.piece_embedding = nnx.Embed(N_PIECE_TYPES, MODEL_WIDTH, rngs=rngs)
         self.positional_embedding = nnx.Embed(N_SQUARES, MODEL_WIDTH, rngs=rngs)
 
-        self.blocks = nnx.List([
-            TransformerBlock(rngs=rngs, c_dtype=jnp.bfloat16, n_dtype=jnp.float32) for _ in range(MODEL_LAYERS)
-        ])
+        @nnx.split_rngs(splits=MODEL_LAYERS)
+        @nnx.vmap(in_axes=0, out_axes=0)
+        def create_blocks(rngs: nnx.Rngs):
+            return TransformerBlock(rngs=rngs, c_dtype=jnp.bfloat16, n_dtype=jnp.float32)
+
+        self.blocks = create_blocks(rngs)
         self.final_norm = nnx.RMSNorm(MODEL_WIDTH, rngs=rngs, dtype=jnp.float32)
         self.head = nnx.Linear(MODEL_WIDTH, 1, use_bias=False, rngs=rngs, dtype=jnp.bfloat16)
 
@@ -142,8 +146,12 @@ class ZeuxoModel(nnx.Module):
         # pos = jnp.broadcast_to(jax.nn.one_hot(jnp.arange(N_SQUARES), N_SQUARES), (tokens.shape[0], N_SQUARES, N_SQUARES)) # (batch, 64, 64)
         x = self.piece_embedding(tokens) + self.positional_embedding(jnp.arange(N_SQUARES)) # (batch, 64, MODEL_WIDTH)
 
-        for block in self.blocks:
-            x = block(x) # (batch, 64, MODEL_WIDTH)
+        @nnx.scan(in_axes=(0, nnx.Carry), out_axes=nnx.Carry)
+        @nnx.remat
+        def forward(block: TransformerBlock, x: jax.Array) -> jax.Array:
+            return block(x)
+
+        x = forward(self.blocks, x) # (batch, 64, MODEL_WIDTH)
 
         x = self.final_norm(x) # (batch, 64, MODEL_WIDTH)
         x_reduced = jnp.mean(x, axis=1) # (batch, MODEL_WIDTH)
@@ -183,6 +191,89 @@ def eval_step(model: ZeuxoModel, metrics: nnx.MultiMetric, batch: dict[str, jax.
     )
 
 
+class ShuffledBatchesIterDataset(grain.IterDataset):
+    """Vectorised replacement for ParquetIterDataset + WindowShuffle + batch.
+
+    Reads whole parquet files at a time, block-shuffles windows of at least
+    window_size rows with a numpy permutation, and yields ready-made batches.
+    grain's row-at-a-time pipeline decoded ~3k rows/s/worker, stalling the GPU
+    for the length of every window refill.
+    """
+
+    def __init__(self, paths: list[str], *, window_size: int, batch_size: int, seed: int):
+        super().__init__()
+        self._paths = paths
+        self._window_size = window_size
+        self._batch_size = batch_size
+        self._seed = seed
+
+    def set_slice(self, sl: slice, sequential_slice: bool = False):
+        # sharding hook used by mp_prefetch to split files across workers
+        self._paths = self._paths[sl]
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _ShuffledBatchesIterator(self._paths, self._window_size, self._batch_size, self._seed)
+
+
+class _ShuffledBatchesIterator(grain.DatasetIterator):
+    def __init__(self, paths: list[str], window_size: int, batch_size: int, seed: int):
+        super().__init__()
+        self._paths = paths
+        self._window_size = window_size
+        self._batch_size = batch_size
+        self._seed = seed
+        self._next_file = 0
+        self._window_start_file = 0
+        self._window_index = 0
+        self._batch_index = 0
+        self._window: tuple[np.ndarray, np.ndarray] | None = None
+
+    def _fill_window(self) -> bool:
+        features, evals = [], []
+        rows = 0
+        self._window_start_file = self._next_file
+        while rows < self._window_size and self._next_file < len(self._paths):
+            table = pq.read_table(self._paths[self._next_file], columns=["features", "eval"])
+            features.append(table.column("features").combine_chunks().values.to_numpy().reshape(-1, N_SQUARES))
+            evals.append(table.column("eval").combine_chunks().to_numpy())
+            rows += len(table)
+            self._next_file += 1
+        if rows == 0:
+            return False
+        perm = np.random.default_rng((self._seed, self._window_index)).permutation(rows)
+        self._window = (np.concatenate(features)[perm], np.concatenate(evals)[perm])
+        self._batch_index = 0
+        return True
+
+    def __next__(self) -> dict[str, np.ndarray]:
+        while True:
+            if self._window is None:
+                if not self._fill_window():
+                    raise StopIteration
+            start = self._batch_index * self._batch_size
+            end = start + self._batch_size
+            if end <= len(self._window[1]):
+                self._batch_index += 1
+                return {"features": self._window[0][start:end], "eval": self._window[1][start:end]}
+            # window exhausted; the sub-batch remainder is dropped
+            self._window = None
+            self._window_index += 1
+
+    def get_state(self):
+        return {
+            "window_start_file": self._window_start_file,
+            "window_index": self._window_index,
+            "batch_index": self._batch_index,
+        }
+
+    def set_state(self, state):
+        self._next_file = state["window_start_file"]
+        self._window_index = state["window_index"]
+        self._window = None
+        if self._fill_window():
+            self._batch_index = state["batch_index"]
+
+
 def load_test_data(path: Path) -> tuple[dict[str, jax.Array], int]:
     # eval sample must stay bit-identical to the old FileSource one: same scan order, permutation and device layout
     schema = pa.schema([
@@ -216,11 +307,11 @@ def model_info() -> None:
         by_top[top] = by_top.get(top, 0) + v.size
     for top, size in by_top.items():
         print(f"  {top:<24} {size:>12,}  ({size / n_params:.1%})")
-    print("\nblocks[0]:")
+    print("\nblocks (stacked over layers):")
     for path, v in flat:
-        if path[:2] == ("blocks", 0):
-            name = ".".join(str(k) for k in path[2:])
-            print(f"  {name:<24} {str(v.shape):>14}  {v.dtype}  {v.size:>10,}")
+        if path[0] == "blocks":
+            name = ".".join(str(k) for k in path[1:])
+            print(f"  {name:<24} {str(v.shape):>18}  {v.dtype}  {v.size:>10,}")
 
 
 def main() -> None:
@@ -255,12 +346,12 @@ def main() -> None:
     random.Random(SEED).shuffle(training_samples)
     train_rows = pds.dataset(training_samples).count_rows()
     epochs = math.ceil(train_boards / train_rows)
-    dataset = (grain.experimental.WindowShuffleIterDataset(
-        grain.experimental.ParquetIterDataset(training_samples * epochs),
+    dataset = (ShuffledBatchesIterDataset(
+        training_samples * epochs,
         window_size=1<<23,
-        seed = SEED
+        batch_size=batch_size,
+        seed=SEED,
         )
-        .batch(batch_size, drop_remainder=True)
         .map(lambda batch: {
             "features": batch["features"],
             "label": expit(batch["eval"].astype(np.float32) / LOGISTIC_SCALING),
@@ -394,10 +485,10 @@ def main() -> None:
                     mlflow.log_metric(m, metrics_history[m][-1], step=step)
                 t_last = time.perf_counter()
 
-            if (step + 1) % checkpoint_freq == 0 and step + 1 < iterations:
-                t_ckpt = time.perf_counter()
-                save_checkpoint(f"step_{step:08d}")
-                t_last += time.perf_counter() - t_ckpt
+            # if (step + 1) % checkpoint_freq == 0 and step + 1 < iterations:
+            #     t_ckpt = time.perf_counter()
+            #     save_checkpoint(f"step_{step:08d}")
+            #     t_last += time.perf_counter() - t_ckpt
 
             if step >= iterations - 1:
                 break
