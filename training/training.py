@@ -386,11 +386,11 @@ def main() -> None:
             return any(getattr(k, "key", None) == "kernel" or getattr(k, "name", None) == "kernel" for k in path)
         return jax.tree_util.tree_map_with_path(is_kernel, params)
 
-    optimizer = nnx.ModelAndOptimizer(model, 
-        optax.chain(
+    optimizer = nnx.ModelAndOptimizer(model,
+        optax.apply_if_finite(optax.chain(
             optax.clip_by_global_norm(CLIP_GRAD_NORM),
             optax.adamw(schedule, mask=weight_decay_mask, b2=ADAM_B2)
-            )
+            ), max_consecutive_errors=100)
         )
 
     checkpointer = ocp.StandardCheckpointer()
@@ -485,10 +485,10 @@ def main() -> None:
                     mlflow.log_metric(m, metrics_history[m][-1], step=step)
                 t_last = time.perf_counter()
 
-            # if (step + 1) % checkpoint_freq == 0 and step + 1 < iterations:
-            #     t_ckpt = time.perf_counter()
-            #     save_checkpoint(f"step_{step:08d}")
-            #     t_last += time.perf_counter() - t_ckpt
+            if (step + 1) % checkpoint_freq == 0 and step + 1 < iterations:
+                t_ckpt = time.perf_counter()
+                save_checkpoint(f"step_{step:08d}")
+                t_last += time.perf_counter() - t_ckpt
 
             if step >= iterations - 1:
                 break
