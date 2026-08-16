@@ -18,6 +18,7 @@
 # ///
 
 import argparse
+import hashlib
 import logging
 import math
 import os
@@ -41,6 +42,8 @@ import pyarrow as pa
 import pyarrow.dataset as pds
 import pyarrow.parquet as pq
 import mlflow
+from mlflow.data.dataset_source_registry import resolve_dataset_source
+from mlflow.data.meta_dataset import MetaDataset
 import absl.flags
 
 logger = logging.getLogger(__name__)
@@ -50,9 +53,9 @@ N_SQUARES = 64
 N_PIECE_TYPES = 16  # 0 empty, 1 ep-capturable pawn, then our/their pawn..king with separate castling-rook tokens (see data/Encoding.scala)
 MODEL_LAYERS = 16 # How many transformer blocks to use;
 MODEL_WIDTH = 512 
-ATTENTION_WIDTH = 32 # Width of each attention head
-N_HEADS = 32 # How many attention heads to use in the transformer
-MLP_WIDTH = MODEL_WIDTH * 2 # Hidden width of the MLP blocks
+N_HEADS = 16 # How many attention heads to use in the transformer
+ATTENTION_WIDTH = 2 * MODEL_WIDTH//N_HEADS # Width of each attention head
+MLP_WIDTH = 2 * MODEL_WIDTH # Hidden width of the MLP blocks
 
 LOGISTIC_SCALING = 400.0  # centipawns -> win prob via sigmoid(eval / scaling)
 
@@ -295,6 +298,15 @@ def load_test_data(path: Path) -> tuple[dict[str, jax.Array], int]:
     return data, test_rows
 
 
+def dataset_meta(train_file: Path, split: str) -> MetaDataset:
+    # metadata-only lineage: digest over file names + sizes, the parquet data is never read
+    split_dir = train_file / f"setType={split}"
+    digest = hashlib.sha256()
+    for f in sorted(split_dir.glob("*.parquet")):
+        digest.update(f"{f.name}:{f.stat().st_size}".encode())
+    return MetaDataset(resolve_dataset_source(str(split_dir)), name=f"{train_file.name}-{split}", digest=digest.hexdigest()[:8])
+
+
 def model_info() -> None:
     model = ZeuxoModel(rngs=nnx.Rngs(SEED))
     flat = nnx.state(model, nnx.Param).flat_state()
@@ -448,6 +460,8 @@ def main() -> None:
             "test_samples": test_rows,
         })
         mlflow.set_tag("device", jax.devices()[0].device_kind)
+        mlflow.log_input(dataset_meta(train_file, "train"), context="training")
+        mlflow.log_input(dataset_meta(train_file, "test"), context="eval")
         mlflow.log_artifact(str(script_path), artifact_path="code")
 
         logger.info(f"Training for {train_boards:,} boards ({iterations:,} iterations)")

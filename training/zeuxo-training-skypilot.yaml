@@ -16,7 +16,7 @@ envs:
   HYPERPARAM_BATCH_SIZE_LOG: 12  # batch size = 2^this
   HYPERPARAM_LEARNING_RATE_PEAK: 4e-4
   HYPERPARAM_LEARNING_RATE_END: 2e-6
-  ATTENTION_IMPL: xla
+  ATTENTION_IMPL: cudnn
   TRAIN_FILE: /datasets/chess-data
   CHECKPOINT_PATH: /checkpoints
 
